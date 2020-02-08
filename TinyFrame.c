@@ -438,7 +438,7 @@ static void _TF_FN TF_HandleReceivedMessage(TinyFrame *tf)
     msg.frame_id = tf->id;
     msg.is_response = false;
     msg.type = tf->type;
-    msg.data = tf->data;
+    msg.data = tf->data + TF_DATA_OFFSET;
     msg.len = tf->len;
 
     // Any listener can consume the message, or let someone else handle it.
@@ -558,6 +558,8 @@ void _TF_FN TF_Accept(TinyFrame *tf, const uint8_t *buffer, uint32_t count)
 void _TF_FN TF_ResetParser(TinyFrame *tf)
 {
     tf->state = TFState_SOF;
+    tf->rxi = 0;
+    tf->proci = 0;
     // more init will be done by the parser when the first byte is received
 }
 
@@ -573,7 +575,41 @@ static void _TF_FN pars_begin_frame(TinyFrame *tf) {
 
     // Enter ID state
     tf->state = TFState_ID;
-    tf->rxi = 0;
+    tf->fldi = 0;
+}
+
+static void parser_process(TinyFrame *tf);
+static inline void process_char(TinyFrame *tf, unsigned char c);
+
+static void parser_drop_bytes(TinyFrame *tf, TF_LEN drop_count) {
+    if (drop_count > tf->rxi) {
+        drop_count = tf->rxi;
+    }
+    TF_LEN remaining = tf->rxi - drop_count;
+
+    TF_ResetParser(tf);
+    memmove(tf->data, tf->data + drop_count, remaining);
+    tf->rxi = remaining;
+    tf->proci = 0;
+}
+
+static void reset_parser_to_next_sof(TinyFrame *tf) {
+    bool found_sof = false;
+
+#if TF_USE_SOF_BYTE && TF_CKSUM_TYPE != TF_CKSUM_NONE
+    if (tf->rxi > 0) {
+        uint8_t *next_sof = memchr(tf->data + 1, TF_SOF_BYTE, tf->rxi - 1);
+        if (next_sof != NULL) {
+            TF_LEN drop_count = next_sof - tf->data;
+            parser_drop_bytes(tf, drop_count);
+            found_sof = true;
+        }
+    }
+#endif
+
+    if (!found_sof) {
+        TF_ResetParser(tf);
+    }
 }
 
 /** Handle a received char - here's the main state machine */
@@ -582,18 +618,39 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
     // Parser timeout - clear
     if (tf->parser_timeout_ticks >= TF_PARSER_TIMEOUT_TICKS) {
         if (tf->state != TFState_SOF) {
-            TF_ResetParser(tf);
+            reset_parser_to_next_sof(tf);
             TF_Error("Parser timeout");
         }
     }
     tf->parser_timeout_ticks = 0;
 
+    if (!tf->discard_data) {
+        // TODO: Do this a better way...
+        if (tf->rxi >= sizeof(tf->data)) {
+            reset_parser_to_next_sof(tf);
+        }
+        tf->data[tf->rxi++] = c;
+    }
+
+    parser_process(tf);
+}
+
+static void parser_process(TinyFrame *tf) {
+    // Note tf->proci and tf->rxi may be altered from within process_char.
+    while (tf->proci < tf->rxi) {
+        unsigned char c = tf->data[tf->proci++];
+        process_char(tf, c);
+    }
+}
+
+static inline void process_char(TinyFrame *tf, unsigned char c)
+{
 // DRY snippet - collect multi-byte number from the input stream, byte by byte
 // This is a little dirty, but makes the code easier to read. It's used like e.g. if(),
 // the body is run only after the entire number (of data type 'type') was received
 // and stored to 'dest'
 #define COLLECT_NUMBER(dest, type) dest = (type)(((dest) << 8) | c); \
-                                   if (++tf->rxi == sizeof(type))
+                                   if (++tf->fldi == sizeof(type))
 
 #if !TF_USE_SOF_BYTE
     if (tf->state == TFState_SOF) {
@@ -605,6 +662,11 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
     switch (tf->state) {
         case TFState_SOF:
             if (c == TF_SOF_BYTE) {
+                // TODO: Do this a better way...
+                if (tf->proci > 1) {
+                    reset_parser_to_next_sof(tf);
+                    tf->proci = 1;
+                }
                 pars_begin_frame(tf);
             }
             break;
@@ -614,7 +676,7 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
             COLLECT_NUMBER(tf->id, TF_ID) {
                 // Enter LEN state
                 tf->state = TFState_LEN;
-                tf->rxi = 0;
+                tf->fldi = 0;
             }
             break;
 
@@ -623,7 +685,7 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
             COLLECT_NUMBER(tf->len, TF_LEN) {
                 // Enter TYPE state
                 tf->state = TFState_TYPE;
-                tf->rxi = 0;
+                tf->fldi = 0;
             }
             break;
 
@@ -632,11 +694,11 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
             COLLECT_NUMBER(tf->type, TF_TYPE) {
                 #if TF_CKSUM_TYPE == TF_CKSUM_NONE
                     tf->state = TFState_DATA;
-                    tf->rxi = 0;
+                    tf->fldi = 0;
                 #else
                     // enter HEAD_CKSUM state
                     tf->state = TFState_HEAD_CKSUM;
-                    tf->rxi = 0;
+                    tf->fldi = 0;
                     tf->ref_cksum = 0;
                 #endif
             }
@@ -649,40 +711,44 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
 
                 if (tf->cksum != tf->ref_cksum) {
                     TF_Error("Rx head cksum mismatch");
-                    TF_ResetParser(tf);
+                    reset_parser_to_next_sof(tf);
                     break;
                 }
 
                 if (tf->len == 0) {
                     // if the message has no body, we're done.
                     TF_HandleReceivedMessage(tf);
-                    TF_ResetParser(tf);
+                    parser_drop_bytes(tf, tf->proci);
                     break;
                 }
 
                 // Enter DATA state
                 tf->state = TFState_DATA;
-                tf->rxi = 0;
+                tf->fldi = 0;
 
                 CKSUM_RESET(tf->cksum); // Start collecting the payload
 
                 if (tf->len > TF_MAX_PAYLOAD_RX) {
                     TF_Error("Rx payload too long: %d", (int)tf->len);
-                    // ERROR - frame too long. Consume, but do not store.
-                    tf->discard_data = true;
+                    // ERROR - frame too long.
+                    #if TF_USE_SOF_BYTE && TF_CKSUM_TYPE != TF_CKSUM_NONE
+                        // Can't guarantee the data checksum will pass, and if it didn't we would of had to drop some
+                        // possibly valid data before finding out. So just reset on the next SOF and eventually
+                        // resynchronise on the next valid header.
+                        reset_parser_to_next_sof(tf);
+                    #else
+                        // Consume, but do not store.
+                        tf->discard_data = true;
+                    #endif
                 }
             }
             break;
 
         case TFState_DATA:
-            if (tf->discard_data) {
-                tf->rxi++;
-            } else {
-                CKSUM_ADD(tf->cksum, c);
-                tf->data[tf->rxi++] = c;
-            }
+            CKSUM_ADD(tf->cksum, c);
+            tf->fldi++;
 
-            if (tf->rxi == tf->len) {
+            if (tf->fldi == tf->len) {
                 #if TF_CKSUM_TYPE == TF_CKSUM_NONE
                     // All done
                     TF_HandleReceivedMessage(tf);
@@ -690,7 +756,7 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
                 #else
                     // Enter DATA_CKSUM state
                     tf->state = TFState_DATA_CKSUM;
-                    tf->rxi = 0;
+                    tf->fldi = 0;
                     tf->ref_cksum = 0;
                 #endif
             }
@@ -700,15 +766,15 @@ void _TF_FN TF_AcceptChar(TinyFrame *tf, unsigned char c)
             COLLECT_NUMBER(tf->ref_cksum, TF_CKSUM) {
                 // Check the header checksum against the computed value
                 CKSUM_FINALIZE(tf->cksum);
-                if (!tf->discard_data) {
-                    if (tf->cksum == tf->ref_cksum) {
+                if (tf->cksum == tf->ref_cksum) {
+                    if (!tf->discard_data) {
                         TF_HandleReceivedMessage(tf);
-                    } else {
-                        TF_Error("Body cksum mismatch");
                     }
+                    parser_drop_bytes(tf, tf->proci);
+                } else {
+                    TF_Error("Body cksum mismatch");
+                    reset_parser_to_next_sof(tf);
                 }
-
-                TF_ResetParser(tf);
             }
             break;
     }

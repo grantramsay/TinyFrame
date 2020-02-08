@@ -79,6 +79,18 @@
     #error Bad value for TF_CKSUM_TYPE
 #endif
 
+#define TF_SOF_OFFSET           0
+#if TF_USE_SOF_BYTE
+#define TF_ID_OFFSET            (TF_SOF_OFFSET + sizeof(unsigned char))
+#else
+#define TF_ID_OFFSET            TF_SOF_OFFSET
+#endif
+#define TF_LEN_OFFSET           (TF_ID_OFFSET + sizeof(TF_ID))
+#define TF_TYPE_OFFSET          (TF_LEN_OFFSET + sizeof(TF_LEN))
+#define TF_HEAD_CKSUM_OFFSET    (TF_TYPE_OFFSET + sizeof(TF_TYPE))
+#define TF_DATA_OFFSET          (TF_HEAD_CKSUM_OFFSET + sizeof(TF_CKSUM))
+#define TF_MAX_PACKET_RX        (TF_DATA_OFFSET + TF_MAX_PAYLOAD_RX + sizeof(TF_CKSUM))
+
 //endregion
 
 //---------------------------------------------------------------------------
@@ -439,8 +451,10 @@ struct TinyFrame_ {
     TF_TICKS parser_timeout_ticks;
     TF_ID id;               //!< Incoming packet ID
     TF_LEN len;             //!< Payload length
-    uint8_t data[TF_MAX_PAYLOAD_RX]; //!< Data byte buffer
-    TF_LEN rxi;             //!< Field size byte counter
+    uint8_t data[TF_MAX_PACKET_RX]; //!< Data byte buffer
+    TF_LEN rxi;             //!< Packet size byte counter
+    TF_LEN proci;           //!< Processing index
+    TF_LEN fldi;              //!< Field size byte counter
     TF_CKSUM cksum;         //!< Checksum calculated of the data stream
     TF_CKSUM ref_cksum;     //!< Reference checksum read from the message
     TF_TYPE type;           //!< Collected message type number

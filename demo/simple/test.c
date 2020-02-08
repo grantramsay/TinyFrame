@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../../TinyFrame.h"
 #include "../utils.h"
@@ -42,7 +43,7 @@ TF_Result testIdListener(TinyFrame *tf, TF_Msg *msg)
     return TF_CLOSE;
 }
 
-void main(void)
+int main(void)
 {
     TF_Msg msg;
     const char *longstr = "Lorem ipsum dolor sit amet.";
@@ -81,4 +82,6 @@ void main(void)
     msg.data = (pu8) "Hello2";
     msg.len = 7;
     TF_Send(demo_tf, &msg);
+
+    return EXIT_SUCCESS;
 }
